@@ -10,6 +10,8 @@ import socket
 import gc
 import json
 import os
+import threading
+import queue as _queue
 
 device_id = sys.device_id()
 
@@ -473,22 +475,122 @@ cam = camera.Camera(detector.input_width(), detector.input_height(), detector.in
 disp = display.Display()
 
 # =========================
+# Web control server (порт 8765) — приём команд от браузера
+# =========================
+_cmd_queue = _queue.Queue(maxsize=30)
+
+class WebControlServer:
+    def __init__(self, port=8765):
+        self.port = port
+        self._running = False
+
+    def start(self):
+        self._running = True
+        t = threading.Thread(target=self._serve, daemon=True)
+        t.start()
+        print(f"🌐 Панель управления: http://{{ip}}:{self.port}/")
+
+    def _serve(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.port))
+        srv.listen(3)
+        srv.settimeout(1.0)
+        while self._running:
+            try:
+                conn, _ = srv.accept()
+                self._handle(conn)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+        srv.close()
+
+    def _handle(self, conn):
+        try:
+            raw = conn.recv(1024).decode("utf-8", errors="replace")
+            line = raw.split("\r\n")[0]
+            parts = line.split(" ")
+            if len(parts) < 2:
+                return
+            path = parts[1]
+            qs = path.split("?", 1)[1] if "?" in path else ""
+            params = {}
+            for p in qs.split("&"):
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    params[k] = v
+            if "/set" in path:
+                _cmd_queue.put_nowait(params)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: text/plain\r\n\r\nOK")
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+# =========================
 # HTTP JPEG streamer (трансляция экрана на телефон по Wi-Fi)
 # =========================
 html_page = """<!DOCTYPE html>
 <html>
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AOG Trapez - Live</title>
-    <style>
-        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; text-align: center; }
-        h2 { margin: 8px; font-size: 16px; }
-        img { max-width: 100%; height: auto; }
-    </style>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>AOG Trapez</title>
+<style>
+  body{margin:0;background:#111;color:#eee;font-family:sans-serif;font-size:14px}
+  img{width:100%;display:block}
+  .panel{padding:8px 10px}
+  .row{display:flex;align-items:center;margin:5px 0;gap:8px}
+  .row label{width:130px;flex-shrink:0}
+  .row input[type=range]{flex:1}
+  .row span{width:38px;text-align:right}
+  .btns{display:flex;gap:8px;margin:8px 0}
+  button{flex:1;padding:10px;font-size:14px;font-weight:bold;border:none;border-radius:6px}
+  #bdet{background:#0a0;color:#fff}
+  #bsave{background:#f90;color:#000}
+  h3{margin:6px 0 2px;color:#aaa;font-size:12px;text-transform:uppercase}
+</style>
 </head>
 <body>
-    <h2>MaixCAM - AOG Trapez Live</h2>
-    <img src="/stream" alt="Stream">
+<img src="/stream">
+<div class="panel">
+  <h3>Main zone</h3>
+  <div class="row"><label>Bottom Y</label><input type="range" id="z_yA" min="50" max="99" oninput="send()"><span id="z_yA_v"></span></div>
+  <div class="row"><label>Top Y</label><input type="range" id="z_yB" min="1" max="50" oninput="send()"><span id="z_yB_v"></span></div>
+  <div class="row"><label>Bottom width</label><input type="range" id="z_na" min="6" max="49" oninput="send()"><span id="z_na_v"></span></div>
+  <div class="row"><label>Top width</label><input type="range" id="z_fa" min="4" max="48" oninput="send()"><span id="z_fa_v"></span></div>
+  <h3>Hood zone</h3>
+  <div class="row"><label>Top Y</label><input type="range" id="e_yB" min="10" max="90" oninput="send()"><span id="e_yB_v"></span></div>
+  <div class="row"><label>Bottom width</label><input type="range" id="e_na" min="6" max="45" oninput="send()"><span id="e_na_v"></span></div>
+  <div class="row"><label>Top width</label><input type="range" id="e_fa" min="4" max="44" oninput="send()"><span id="e_fa_v"></span></div>
+  <div class="btns">
+    <button id="bdet" onclick="toggleDet()">DETECT ON</button>
+    <button id="bsave" onclick="saveCfg()">SAVE</button>
+  </div>
+  <div id="status" style="font-size:11px;color:#888;text-align:center"></div>
+</div>
+<script>
+const PORT = 8765;
+const ids = ['z_yA','z_yB','z_na','z_fa','e_yB','e_na','e_fa'];
+const defs = {z_yA:95,z_yB:4,z_na:47,z_fa:8,e_yB:65,e_na:22,e_fa:12};
+ids.forEach(id=>{
+  const s=document.getElementById(id);
+  s.value=defs[id];
+  document.getElementById(id+'_v').textContent=defs[id]+'%';
+  s.oninput=()=>{document.getElementById(id+'_v').textContent=s.value+'%';send();};
+});
+function cmd(params){
+  fetch('http://'+location.hostname+':'+PORT+'/set?'+params)
+    .then(()=>{document.getElementById('status').textContent=new Date().toLocaleTimeString()+' OK';})
+    .catch(()=>{document.getElementById('status').textContent='❌ нет связи';});
+}
+function send(){
+  const p=ids.map(id=>id+'='+document.getElementById(id).value).join('&');
+  cmd(p);
+}
+function toggleDet(){cmd('toggle_det=1');}
+function saveCfg(){cmd('save=1');}
+</script>
 </body>
 </html>"""
 
@@ -513,6 +615,8 @@ wifi_manager = WiFiManager()
 SSID = "AOG4"
 PASSWORD = "12345678"
 wifi_connected = wifi_manager.connect(SSID, PASSWORD)
+web_server = WebControlServer(port=8765)
+web_server.start()
 
 # =========================
 # Angle receiver
@@ -547,6 +651,22 @@ while not app.need_exit():
     img = cam.read()
     objs = detector.detect(img, conf_th=0.5, iou_th=0.45)
     target_objects = [o for o in objs if o.class_id in class_names]
+
+    # web commands
+    while not _cmd_queue.empty():
+        try:
+            p = _cmd_queue.get_nowait()
+            if "z_yA" in p: zone_config.yA_ratio        = clamp(int(p["z_yA"]), 50, 99) / 100.0
+            if "z_yB" in p: zone_config.yB_ratio        = clamp(int(p["z_yB"]),  1, 50) / 100.0
+            if "z_na" in p: zone_config.near_half_ratio = clamp(int(p["z_na"]),   6, 49) / 100.0
+            if "z_fa" in p: zone_config.far_half_ratio  = clamp(int(p["z_fa"]),   4, 48) / 100.0
+            if "e_yB" in p: exclusion_zone.yB_ratio     = clamp(int(p["e_yB"]), 10, 90) / 100.0
+            if "e_na" in p: exclusion_zone.near_half_ratio = clamp(int(p["e_na"]), 6, 45) / 100.0
+            if "e_fa" in p: exclusion_zone.far_half_ratio  = clamp(int(p["e_fa"]), 4, 44) / 100.0
+            if p.get("toggle_det") == "1": zone_config.toggle_obstacle_detection()
+            if p.get("save") == "1": save_config(zone_config, exclusion_zone)
+        except Exception:
+            pass
 
     # angle
     if angle_receiver.receive_angle():
