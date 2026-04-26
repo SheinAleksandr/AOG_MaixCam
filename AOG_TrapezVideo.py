@@ -137,11 +137,11 @@ class ZoneConfig:
         self.shift_far_k = 1.0 # коэффициэнт движения вершины
 
         # base geometry in pixels derived from ratios (init)
-        self.yA_ratio = 0.90  # bottom line y (AD)
-        self.yB_ratio = 0.28  # top line y (BC)
+        self.yA_ratio = 0.95  # bottom line y (AD) — почти у нижнего края
+        self.yB_ratio = 0.04  # top line y (BC)    — у самого верха
 
-        self.near_half_ratio = 0.30  # half width of bottom AD
-        self.far_half_ratio  = 0.14  # half width of top BC
+        self.near_half_ratio = 0.47  # half width of bottom AD — широкий низ
+        self.far_half_ratio  = 0.08  # half width of top BC    — узкий верх
 
         # steering shift behavior
         self.max_shift_ratio = 0.4
@@ -178,7 +178,7 @@ class ZoneConfig:
         yB = int(H * self.yB_ratio)
 
         # ensure valid ordering & min height
-        yA = clamp(yA, int(H * 0.55), H - 1)        # bottom must be lower half
+        yA = clamp(yA, int(H * 0.50), H - 1)        # bottom must be lower half
         yB = clamp(yB, 0, int(H * 0.80))            # top must be upper-ish
         if yA - yB < self.min_height_px:
             yB = max(0, yA - self.min_height_px)
