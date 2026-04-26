@@ -8,8 +8,57 @@ from maix import camera, display, image, nn, app, sys, time, network, http
 from maix.touchscreen import TouchScreen
 import socket
 import gc
+import json
+import os
 
 device_id = sys.device_id()
+
+CONFIG_PATH = "/maixapp/apps/kun1/zone_config.json"
+
+def save_config(zone, excl):
+    data = {
+        "zone": {
+            "yA_ratio":        zone.yA_ratio,
+            "yB_ratio":        zone.yB_ratio,
+            "near_half_ratio": zone.near_half_ratio,
+            "far_half_ratio":  zone.far_half_ratio,
+            "obstacle_detection_enabled": zone.obstacle_detection_enabled,
+        },
+        "exclusion": {
+            "yA_ratio":        excl.yA_ratio,
+            "yB_ratio":        excl.yB_ratio,
+            "near_half_ratio": excl.near_half_ratio,
+            "far_half_ratio":  excl.far_half_ratio,
+        }
+    }
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(data, f)
+        print(f"💾 Настройки сохранены: {CONFIG_PATH}")
+    except Exception as e:
+        print(f"❌ Ошибка сохранения: {e}")
+
+def load_config(zone, excl):
+    if not os.path.exists(CONFIG_PATH):
+        print("ℹ️ Файл настроек не найден, используются значения по умолчанию")
+        return
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            data = json.load(f)
+        z = data.get("zone", {})
+        zone.yA_ratio        = z.get("yA_ratio",        zone.yA_ratio)
+        zone.yB_ratio        = z.get("yB_ratio",        zone.yB_ratio)
+        zone.near_half_ratio = z.get("near_half_ratio", zone.near_half_ratio)
+        zone.far_half_ratio  = z.get("far_half_ratio",  zone.far_half_ratio)
+        zone.obstacle_detection_enabled = z.get("obstacle_detection_enabled", zone.obstacle_detection_enabled)
+        e = data.get("exclusion", {})
+        excl.yA_ratio        = e.get("yA_ratio",        excl.yA_ratio)
+        excl.yB_ratio        = e.get("yB_ratio",        excl.yB_ratio)
+        excl.near_half_ratio = e.get("near_half_ratio", excl.near_half_ratio)
+        excl.far_half_ratio  = e.get("far_half_ratio",  excl.far_half_ratio)
+        print(f"✅ Настройки загружены: {CONFIG_PATH}")
+    except Exception as e:
+        print(f"❌ Ошибка загрузки настроек: {e}")
 
 # =========================
 # TouchScreen init
@@ -297,7 +346,7 @@ class ZoneConfig:
                 self.edit_mode = False
                 self.selected = None
                 exclusion_zone.selected = None
-                print("💾 EDIT OFF")
+                save_config(self, exclusion_zone)
                 return True
             if det_x <= x <= det_x + btn_w and btn_y <= y <= btn_y + btn_h:
                 self.toggle_obstacle_detection()
@@ -475,6 +524,7 @@ angle_receiver = AngleReceiver()
 # =========================
 zone_config = ZoneConfig(cam.width(), cam.height())
 exclusion_zone = ExclusionZone(cam.width(), cam.height())
+load_config(zone_config, exclusion_zone)
 touch_calibrator = TouchCalibrator(cam.width(), cam.height())
 
 print(f"📱 Разрешение: {cam.width()}x{cam.height()}")
