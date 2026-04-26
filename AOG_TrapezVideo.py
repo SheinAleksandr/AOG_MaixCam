@@ -284,18 +284,19 @@ class ZoneConfig:
                 if edit_x <= x <= edit_x + btn_w and btn_y <= y <= btn_y + btn_h:
                     self.edit_mode = True
                     self.selected = None
-                    print("📐 EDIT ON: две точки слева (A=низ, B=верх)")
+                    print("📐 EDIT ON")
                     return True
                 if det_x <= x <= det_x + btn_w and btn_y <= y <= btn_y + btn_h:
                     self.toggle_obstacle_detection()
                     return True
             return False
 
-        # editing
+        # edit mode: обе зоны редактируются одновременно
         if pressed == 1:
             if edit_x <= x <= edit_x + btn_w and btn_y <= y <= btn_y + btn_h:
                 self.edit_mode = False
                 self.selected = None
+                exclusion_zone.selected = None
                 print("💾 EDIT OFF")
                 return True
             if det_x <= x <= det_x + btn_w and btn_y <= y <= btn_y + btn_h:
@@ -334,6 +335,61 @@ class ZoneConfig:
             self._set_yB_from_y(y)
             return True
 
+        return False
+
+# =========================
+# ExclusionZone: трапеция-маска капота (объекты внутри игнорируются)
+# =========================
+class ExclusionZone:
+    def __init__(self, width, height):
+        self.width  = width
+        self.height = height
+        self.enabled = True
+
+        self.yA_ratio        = 1.00  # нижняя граница (низ кадра)
+        self.yB_ratio        = 0.65  # верхняя граница капота
+        self.near_half_ratio = 0.22  # полуширина низа — уже главной зоны
+        self.far_half_ratio  = 0.12  # полуширина верха
+
+        self.selected = None
+
+    def get_trapezoid(self):
+        W, H = self.width, self.height
+        cx = W // 2
+        yA = int(H * self.yA_ratio)
+        yB = int(H * self.yB_ratio)
+        na = int(W * self.near_half_ratio)
+        fa = int(W * self.far_half_ratio)
+        A = (cx + na, yA);  B = (cx + fa, yB)
+        C = (cx - fa, yB);  D = (cx - na, yA)
+        def cp(p): return (int(clamp(p[0],0,W-1)), int(clamp(p[1],0,H-1)))
+        return cp(A), cp(B), cp(C), cp(D)
+
+    def get_quad(self):
+        A, B, C, D = self.get_trapezoid()
+        return [D, C, B, A]
+
+    def contains(self, px, py):
+        if not self.enabled:
+            return False
+        return point_in_quad(px, py, self.get_quad())
+
+    # ручки справа (A=right-bottom, B=right-top)
+    def get_right_handles(self):
+        A, B, C, D = self.get_trapezoid()
+        return {"hA": (A[0], A[1]), "hB": (B[0], B[1])}
+
+    def apply_drag(self, x, y):
+        W, H = self.width, self.height
+        cx = W // 2
+        if self.selected == "hA":
+            self.near_half_ratio = clamp(abs(cx - x) / W, 0.06, 0.45)
+            self.yA_ratio        = clamp(y / H, 0.50, 1.00)
+            return True
+        if self.selected == "hB":
+            self.far_half_ratio = clamp(abs(cx - x) / W, 0.04, 0.44)
+            self.yB_ratio       = clamp(y / H, 0.10, 0.90)
+            return True
         return False
 
 # =========================
@@ -418,6 +474,7 @@ angle_receiver = AngleReceiver()
 # Zone + touch calibrator
 # =========================
 zone_config = ZoneConfig(cam.width(), cam.height())
+exclusion_zone = ExclusionZone(cam.width(), cam.height())
 touch_calibrator = TouchCalibrator(cam.width(), cam.height())
 
 print(f"📱 Разрешение: {cam.width()}x{cam.height()}")
@@ -461,18 +518,53 @@ while not app.need_exit():
                 if touch_count <= 6:
                     print(f"👆 Touch#{touch_count}: raw({raw_x},{raw_y}) -> ({x},{y}) pressed={pressed}")
 
-                zone_config.handle_touch(x, y, pressed, steering_angle)
+                # кнопки всегда обрабатываются первыми
+                btn_w, btn_h = 120, 32
+                btn_y_touch = 0
+                in_button = (btn_y_touch <= y <= btn_y_touch + btn_h and
+                             (x <= btn_w or x >= zone_config.width - btn_w))
+
+                if in_button or not zone_config.edit_mode:
+                    zone_config.handle_touch(x, y, pressed, steering_angle)
+                elif zone_config.edit_mode:
+                    if pressed == 1:
+                        # выбираем ближайшую ручку из обеих зон
+                        all_handles = {}
+                        for k, pt in zone_config.get_left_handles(steering_angle).items():
+                            all_handles[('zone', k)] = pt
+                        for k, pt in exclusion_zone.get_right_handles().items():
+                            all_handles[('excl', k)] = pt
+                        best, best_d = None, 1e9
+                        for key, (hx, hy) in all_handles.items():
+                            d = ((x-hx)**2 + (y-hy)**2)**0.5
+                            if d < best_d:
+                                best_d = d; best = key
+                        if best and best_d < zone_config.touch_threshold:
+                            if best[0] == 'zone':
+                                zone_config.selected = best[1]
+                                exclusion_zone.selected = None
+                            else:
+                                exclusion_zone.selected = best[1]
+                                zone_config.selected = None
+                        else:
+                            zone_config.selected = None
+                            exclusion_zone.selected = None
+
+                    if zone_config.selected:
+                        zone_config.handle_touch(x, y, pressed, steering_angle)
+                    elif exclusion_zone.selected:
+                        exclusion_zone.apply_drag(x, y)
         except Exception as e:
             print(f"❌ Ошибка TouchScreen: {e}")
 
     quad, (A, B, C, D) = zone_config.get_quad_for_tests(steering_angle)
 
-    # objects in zone
+    # objects in zone (исключаем попавших в зону капота)
     objects_in_zone = []
     for o in target_objects:
         cx = o.x + o.w // 2
         cy = o.y + o.h // 2
-        if point_in_quad(cx, cy, quad):
+        if point_in_quad(cx, cy, quad) and not exclusion_zone.contains(cx, cy):
             objects_in_zone.append(o)
 
     raw_obstacle = (len(objects_in_zone) > 0) and zone_config.obstacle_detection_enabled
@@ -522,6 +614,22 @@ while not app.need_exit():
     img.draw_line(C[0], C[1], D[0], D[1], color=zone_color, thickness=3)  # CD (left)
     img.draw_line(D[0], D[1], A[0], A[1], color=zone_color, thickness=3)  # DA (bottom)
 
+    # draw exclusion zone (капот)
+    if exclusion_zone.enabled:
+        eA, eB, eC, eD = exclusion_zone.get_trapezoid()
+        exc_color = image.COLOR_RED if not zone_config.edit_mode else image.COLOR_YELLOW
+        img.draw_line(eA[0], eA[1], eB[0], eB[1], color=exc_color, thickness=2)
+        img.draw_line(eB[0], eB[1], eC[0], eC[1], color=exc_color, thickness=2)
+        img.draw_line(eC[0], eC[1], eD[0], eD[1], color=exc_color, thickness=2)
+        img.draw_line(eD[0], eD[1], eA[0], eA[1], color=exc_color, thickness=2)
+        if zone_config.edit_mode:
+            for k, (hx, hy) in exclusion_zone.get_right_handles().items():
+                is_sel = (exclusion_zone.selected == k)
+                c = image.COLOR_RED if is_sel else image.COLOR_YELLOW
+                img.draw_rect(hx-18, hy-18, 36, 36, color=c, thickness=2)
+                img.draw_rect(hx-14, hy-14, 28, 28, color=c, thickness=-1)
+                img.draw_string(hx-30, hy-18, k, color=image.COLOR_WHITE, scale=1.0)
+
     # draw LEFT handles in edit mode
     if zone_config.edit_mode:
         handles = zone_config.get_left_handles(steering_angle)
@@ -536,7 +644,7 @@ while not app.need_exit():
     btn_w, btn_h = 120, 32
     btn_y = 0
 
-    edit_text = "EDIT" if not zone_config.edit_mode else "SAVE"
+    edit_text  = "EDIT" if not zone_config.edit_mode else "SAVE"
     edit_color = image.COLOR_BLUE if not zone_config.edit_mode else image.COLOR_GREEN
     img.draw_rect(0, btn_y, btn_w, btn_h, color=edit_color, thickness=3)
     img.draw_string(12, btn_y + 9, edit_text, color=edit_color, scale=0.9)
