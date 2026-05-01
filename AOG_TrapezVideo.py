@@ -545,7 +545,7 @@ class ObstacleStabilizer:
 # =========================
 # Model / Camera / Display
 # =========================
-detector = nn.YOLOv5(model="/root/models/yolov5s.mud", dual_buff=True)
+detector = nn.YOLO11(model="/root/models/yolo11n.mud", dual_buff=True)
 cam = camera.Camera(detector.input_width(), detector.input_height(), detector.input_format())
 disp = display.Display()
 
