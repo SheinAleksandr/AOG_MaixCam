@@ -24,6 +24,8 @@ def save_config(zone, excl):
             "yB_ratio":        zone.yB_ratio,
             "near_half_ratio": zone.near_half_ratio,
             "far_half_ratio":  zone.far_half_ratio,
+            "lmid_y_ratio":    zone.lmid_y_ratio,
+            "lmid_half_ratio": zone.lmid_half_ratio,
             "obstacle_detection_enabled": zone.obstacle_detection_enabled,
         },
         "exclusion": {
@@ -52,6 +54,8 @@ def load_config(zone, excl):
         zone.yB_ratio        = z.get("yB_ratio",        zone.yB_ratio)
         zone.near_half_ratio = z.get("near_half_ratio", zone.near_half_ratio)
         zone.far_half_ratio  = z.get("far_half_ratio",  zone.far_half_ratio)
+        zone.lmid_y_ratio    = z.get("lmid_y_ratio",    zone.lmid_y_ratio)
+        zone.lmid_half_ratio = z.get("lmid_half_ratio", zone.lmid_half_ratio)
         zone.obstacle_detection_enabled = z.get("obstacle_detection_enabled", zone.obstacle_detection_enabled)
         e = data.get("exclusion", {})
         excl.yA_ratio        = e.get("yA_ratio",        excl.yA_ratio)
@@ -174,6 +178,17 @@ def point_in_quad(px, py, quad):
     return (c1 >= 0 and c2 >= 0 and c3 >= 0 and c4 >= 0) or \
            (c1 <= 0 and c2 <= 0 and c3 <= 0 and c4 <= 0)
 
+def point_in_convex_polygon(px, py, pts):
+    n = len(pts)
+    pos = neg = 0
+    for i in range(n):
+        ax, ay = pts[i]
+        bx, by = pts[(i + 1) % n]
+        c = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+        if c > 0: pos += 1
+        else:     neg += 1
+    return pos == 0 or neg == 0
+
 def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
@@ -206,6 +221,10 @@ class ZoneConfig:
         self.touch_cooldown = 70
 
         self.obstacle_detection_enabled = True
+
+        # side kink handle (L): point on left side that can bow outward
+        self.lmid_y_ratio    = 0.50   # vertical position between yB and yA
+        self.lmid_half_ratio = 0.28   # half-width at kink (> interp → outward bow)
 
         # constraints
         self.min_half_ratio = 0.06
@@ -274,10 +293,48 @@ class ZoneConfig:
 
         return clamp_pt(A), clamp_pt(B), clamp_pt(C), clamp_pt(D)
 
+    def get_hexagon(self, steering_angle=0.0):
+        """
+        Returns 6 vertices: A (bottom-right), Rv (right kink), B (top-right),
+        C (top-left), Lv (left kink), D (bottom-left).
+        Lv/Rv are midpoints on the sides that can bow outward.
+        """
+        W, H = self.width, self.height
+        cx = W // 2
+        _, yA, yB, near_half, far_half = self._get_params_px()
+
+        max_shift = int(W * self.max_shift_ratio)
+        s = self._steer_norm(steering_angle)
+        shift_far  = int(s * max_shift * self.shift_far_k)
+        shift_near = int(0.1 * shift_far)
+
+        # kink y — clamped between yB+5 and yA-5
+        Ly = int(H * clamp(self.lmid_y_ratio, self.yB_ratio + 0.02, self.yA_ratio - 0.02))
+
+        # steering shift at kink y (linear interpolation between near and far shifts)
+        span = yB - yA
+        t = clamp((Ly - yA) / span, 0.0, 1.0) if span != 0 else 0.5
+        shift_L = int(shift_near + t * (shift_far - shift_near))
+
+        # interpolated half on the straight side at kink y (min bound — no inward bow)
+        line_half = int(near_half + t * (far_half - near_half))
+        Lhalf = max(int(W * clamp(self.lmid_half_ratio, 0.01, self.max_half_ratio + 0.15)), line_half)
+
+        def cp(p):
+            return (int(clamp(p[0], 0, W - 1)), int(clamp(p[1], 0, H - 1)))
+
+        A  = cp((cx + near_half + shift_near, yA))
+        Rv = cp((cx + Lhalf     + shift_L,   Ly))
+        B  = cp((cx + far_half  + shift_far,  yB))
+        C  = cp((cx - far_half  + shift_far,  yB))
+        Lv = cp((cx - Lhalf     + shift_L,   Ly))
+        D  = cp((cx - near_half + shift_near, yA))
+        return A, Rv, B, C, Lv, D
+
     def get_quad_for_tests(self, steering_angle=0.0):
-        A, B, C, D = self.get_trapezoid(steering_angle)
-        # polygon for point_in_quad: D->C->B->A
-        return [D, C, B, A], (A, B, C, D)
+        A, Rv, B, C, Lv, D = self.get_hexagon(steering_angle)
+        # polygon CCW/CW — point_in_convex_polygon handles both
+        return [D, Lv, C, B, Rv, A], (A, Rv, B, C, Lv, D)
 
     # ---- handles: two points on LEFT (B=top-left (C), A=bottom-left (D)) ----
     def get_left_handles(self, steering_angle=0.0):
@@ -288,6 +345,11 @@ class ZoneConfig:
             "A": (D[0], D[1]),
             "B": (C[0], C[1]),
         }
+
+    # ---- side handle: left kink point Lv; right is symmetric ----
+    def get_side_handles(self, steering_angle=0.0):
+        A, Rv, B, C, Lv, D = self.get_hexagon(steering_angle)
+        return {"L": Lv}
 
     # ---- update rules per your requirements ----
     def _set_near_from_x(self, x):
@@ -354,7 +416,7 @@ class ZoneConfig:
                 self.toggle_obstacle_detection()
                 return True
 
-        handles = self.get_left_handles(steering_angle)
+        handles = {**self.get_left_handles(steering_angle), **self.get_side_handles(steering_angle)}
 
         # pick nearest handle
         nearest = None
@@ -375,15 +437,28 @@ class ZoneConfig:
 
         # apply drag logic even if pressed==0 (на некоторых прошивках так идет движение)
         if self.selected == "A":
-            # X -> AD, Y -> AB and vertical position of AD
+            # X -> AD, Y -> vertical position of AD
             self._set_near_from_x(x)
             self._set_yA_from_y(y)
             return True
 
         if self.selected == "B":
-            # X -> BC, Y -> AB and vertical position of BC
+            # X -> BC, Y -> vertical position of BC
             self._set_far_from_x(x)
             self._set_yB_from_y(y)
+            return True
+
+        if self.selected in ("L", "R"):
+            # Y -> position along the side (between yB and yA)
+            H, W = self.height, self.width
+            y_min = int(H * self.yB_ratio) + 10
+            y_max = int(H * self.yA_ratio) - 10
+            self.lmid_y_ratio = clamp(y, y_min, y_max) / H
+            # X -> outward bow (half-width at kink)
+            cx_px = W // 2
+            half = abs(cx_px - x)
+            half = clamp(half, int(W * 0.01), int(W * (self.max_half_ratio + 0.15)))
+            self.lmid_half_ratio = half / W
             return True
 
         return False
@@ -478,6 +553,7 @@ disp = display.Display()
 # Web control server (порт 8765) — приём команд от браузера
 # =========================
 _cmd_queue = _queue.Queue(maxsize=30)
+_state_cache = {}
 
 class WebControlServer:
     def __init__(self, port=8765):
@@ -514,6 +590,12 @@ class WebControlServer:
             if len(parts) < 2:
                 return
             path = parts[1]
+
+            if path.startswith("/state"):
+                body = json.dumps(_state_cache)
+                conn.sendall(("HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/json\r\n\r\n" + body).encode("utf-8"))
+                return
+
             qs = path.split("?", 1)[1] if "?" in path else ""
             params = {}
             for p in qs.split("&"):
@@ -559,6 +641,9 @@ html_page = """<!DOCTYPE html>
   <div class="row"><label>Top Y</label><input type="range" id="z_yB" min="1" max="50" oninput="send()"><span id="z_yB_v"></span></div>
   <div class="row"><label>Bottom width</label><input type="range" id="z_na" min="6" max="49" oninput="send()"><span id="z_na_v"></span></div>
   <div class="row"><label>Top width</label><input type="range" id="z_fa" min="4" max="48" oninput="send()"><span id="z_fa_v"></span></div>
+  <h3>Side kink (L/R)</h3>
+  <div class="row"><label>Kink Y pos</label><input type="range" id="z_ly" min="6" max="93" oninput="send()"><span id="z_ly_v"></span></div>
+  <div class="row"><label>Kink bow</label><input type="range" id="z_lh" min="6" max="64" oninput="send()"><span id="z_lh_v"></span></div>
   <h3>Hood zone</h3>
   <div class="row"><label>Top Y</label><input type="range" id="e_yB" min="10" max="90" oninput="send()"><span id="e_yB_v"></span></div>
   <div class="row"><label>Bottom width</label><input type="range" id="e_na" min="6" max="45" oninput="send()"><span id="e_na_v"></span></div>
@@ -571,14 +656,32 @@ html_page = """<!DOCTYPE html>
 </div>
 <script>
 const PORT = 8765;
-const ids = ['z_yA','z_yB','z_na','z_fa','e_yB','e_na','e_fa'];
-const defs = {z_yA:95,z_yB:4,z_na:47,z_fa:8,e_yB:65,e_na:22,e_fa:12};
+const ids = ['z_yA','z_yB','z_na','z_fa','z_ly','z_lh','e_yB','e_na','e_fa'];
+const defs = {z_yA:95,z_yB:4,z_na:47,z_fa:8,z_ly:50,z_lh:28,e_yB:65,e_na:22,e_fa:12};
 ids.forEach(id=>{
   const s=document.getElementById(id);
   s.value=defs[id];
   document.getElementById(id+'_v').textContent=defs[id]+'%';
   s.oninput=()=>{document.getElementById(id+'_v').textContent=s.value+'%';send();};
 });
+// Загружаем реальные значения с камеры
+fetch('http://'+location.hostname+':'+PORT+'/state')
+  .then(r=>r.json())
+  .then(data=>{
+    ids.forEach(id=>{
+      if(data[id]!==undefined){
+        const s=document.getElementById(id);
+        s.value=data[id];
+        document.getElementById(id+'_v').textContent=data[id]+'%';
+      }
+    });
+    if(data.det!==undefined){
+      const b=document.getElementById('bdet');
+      b.textContent=data.det?'DETECT ON':'DETECT OFF';
+    }
+    document.getElementById('status').textContent='✅ значения загружены';
+  })
+  .catch(()=>{document.getElementById('status').textContent='⚠️ дефолтные значения';});
 function cmd(params){
   fetch('http://'+location.hostname+':'+PORT+'/set?'+params)
     .then(()=>{document.getElementById('status').textContent=new Date().toLocaleTimeString()+' OK';})
@@ -660,6 +763,8 @@ while not app.need_exit():
             if "z_yB" in p: zone_config.yB_ratio        = clamp(int(p["z_yB"]),  1, 50) / 100.0
             if "z_na" in p: zone_config.near_half_ratio = clamp(int(p["z_na"]),   6, 49) / 100.0
             if "z_fa" in p: zone_config.far_half_ratio  = clamp(int(p["z_fa"]),   4, 48) / 100.0
+            if "z_ly" in p: zone_config.lmid_y_ratio    = clamp(int(p["z_ly"]),   6, 93) / 100.0
+            if "z_lh" in p: zone_config.lmid_half_ratio = clamp(int(p["z_lh"]),   6, 64) / 100.0
             if "e_yB" in p: exclusion_zone.yB_ratio     = clamp(int(p["e_yB"]), 10, 90) / 100.0
             if "e_na" in p: exclusion_zone.near_half_ratio = clamp(int(p["e_na"]), 6, 45) / 100.0
             if "e_fa" in p: exclusion_zone.far_half_ratio  = clamp(int(p["e_fa"]), 4, 44) / 100.0
@@ -667,6 +772,20 @@ while not app.need_exit():
             if p.get("save") == "1": save_config(zone_config, exclusion_zone)
         except Exception:
             pass
+
+    # обновляем кэш состояния для web-панели
+    _state_cache.update({
+        "z_yA": int(zone_config.yA_ratio        * 100),
+        "z_yB": int(zone_config.yB_ratio         * 100),
+        "z_na": int(zone_config.near_half_ratio  * 100),
+        "z_fa": int(zone_config.far_half_ratio   * 100),
+        "e_yB": int(exclusion_zone.yB_ratio      * 100),
+        "e_na": int(exclusion_zone.near_half_ratio * 100),
+        "e_fa": int(exclusion_zone.far_half_ratio  * 100),
+        "z_ly": int(zone_config.lmid_y_ratio    * 100),
+        "z_lh": int(zone_config.lmid_half_ratio * 100),
+        "det":  1 if zone_config.obstacle_detection_enabled else 0,
+    })
 
     # angle
     if angle_receiver.receive_angle():
@@ -702,6 +821,8 @@ while not app.need_exit():
                         all_handles = {}
                         for k, pt in zone_config.get_left_handles(steering_angle).items():
                             all_handles[('zone', k)] = pt
+                        for k, pt in zone_config.get_side_handles(steering_angle).items():
+                            all_handles[('zone', k)] = pt
                         for k, pt in exclusion_zone.get_right_handles().items():
                             all_handles[('excl', k)] = pt
                         best, best_d = None, 1e9
@@ -727,14 +848,14 @@ while not app.need_exit():
         except Exception as e:
             print(f"❌ Ошибка TouchScreen: {e}")
 
-    quad, (A, B, C, D) = zone_config.get_quad_for_tests(steering_angle)
+    hex_poly, (A, Rv, B, C, Lv, D) = zone_config.get_quad_for_tests(steering_angle)
 
     # objects in zone (исключаем попавших в зону капота)
     objects_in_zone = []
     for o in target_objects:
         cx = o.x + o.w // 2
         cy = o.y + o.h // 2
-        if point_in_quad(cx, cy, quad) and not exclusion_zone.contains(cx, cy):
+        if point_in_convex_polygon(cx, cy, hex_poly) and not exclusion_zone.contains(cx, cy):
             objects_in_zone.append(o)
 
     raw_obstacle = (len(objects_in_zone) > 0) and zone_config.obstacle_detection_enabled
@@ -778,11 +899,13 @@ while not app.need_exit():
     else:
         zone_color = image.COLOR_GRAY
 
-    # draw trapezoid edges: AB, BC, CD, DA
-    img.draw_line(A[0], A[1], B[0], B[1], color=zone_color, thickness=3)  # AB (right)
-    img.draw_line(B[0], B[1], C[0], C[1], color=zone_color, thickness=3)  # BC (top)
-    img.draw_line(C[0], C[1], D[0], D[1], color=zone_color, thickness=3)  # CD (left)
-    img.draw_line(D[0], D[1], A[0], A[1], color=zone_color, thickness=3)  # DA (bottom)
+    # draw hexagon edges: right lower, right upper, top, left upper, left lower, bottom
+    img.draw_line(A[0],  A[1],  Rv[0], Rv[1], color=zone_color, thickness=3)
+    img.draw_line(Rv[0], Rv[1], B[0],  B[1],  color=zone_color, thickness=3)
+    img.draw_line(B[0],  B[1],  C[0],  C[1],  color=zone_color, thickness=3)
+    img.draw_line(C[0],  C[1],  Lv[0], Lv[1], color=zone_color, thickness=3)
+    img.draw_line(Lv[0], Lv[1], D[0],  D[1],  color=zone_color, thickness=3)
+    img.draw_line(D[0],  D[1],  A[0],  A[1],  color=zone_color, thickness=3)
 
     # draw exclusion zone (капот)
     if exclusion_zone.enabled:
@@ -809,6 +932,15 @@ while not app.need_exit():
             img.draw_rect(hx - 20, hy - 20, 40, 40, color=c, thickness=2)
             img.draw_rect(hx - 16, hy - 16, 32, 32, color=c, thickness=-1)
             img.draw_string(hx + 22, hy - 18, k, color=image.COLOR_WHITE, scale=1.1)
+
+        # draw SIDE handles (L=left side midpoint, R=right side midpoint)
+        for k, (hx, hy) in zone_config.get_side_handles(steering_angle).items():
+            is_sel = (zone_config.selected == k)
+            c = image.COLOR_RED if is_sel else image.Color.from_rgb(0, 220, 220)
+            img.draw_rect(hx - 18, hy - 18, 36, 36, color=c, thickness=2)
+            img.draw_rect(hx - 13, hy - 13, 26, 26, color=c, thickness=-1)
+            lbl_x = hx - 30 if k == "L" else hx + 20
+            img.draw_string(lbl_x, hy - 9, k, color=image.COLOR_WHITE, scale=1.1)
 
     # buttons
     btn_w, btn_h = 120, 32
