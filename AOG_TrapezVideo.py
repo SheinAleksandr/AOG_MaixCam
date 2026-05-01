@@ -567,23 +567,34 @@ class WebControlServer:
         print(f"🌐 Панель управления: http://{{ip}}:{self.port}/")
 
     def _serve(self):
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", self.port))
-        srv.listen(3)
-        srv.settimeout(1.0)
         while self._running:
+            srv = None
             try:
-                conn, _ = srv.accept()
-                self._handle(conn)
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-        srv.close()
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("0.0.0.0", self.port))
+                srv.listen(3)
+                srv.settimeout(1.0)
+                while self._running:
+                    try:
+                        conn, _ = srv.accept()
+                        t = threading.Thread(target=self._handle, args=(conn,), daemon=True)
+                        t.start()
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+            except Exception as e:
+                print(f"⚠️ WebServer упал, перезапуск: {e}")
+            finally:
+                if srv:
+                    try: srv.close()
+                    except Exception: pass
+            time.sleep_ms(500)
 
     def _handle(self, conn):
         try:
+            conn.settimeout(5.0)
             raw = conn.recv(1024).decode("utf-8", errors="replace")
             line = raw.split("\r\n")[0]
             parts = line.split(" ")
@@ -616,6 +627,7 @@ class WebControlServer:
 html_page = """<!DOCTYPE html>
 <html>
 <head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>AOG Trapez</title>
 <style>
@@ -679,13 +691,13 @@ fetch('http://'+location.hostname+':'+PORT+'/state')
       const b=document.getElementById('bdet');
       b.textContent=data.det?'DETECT ON':'DETECT OFF';
     }
-    document.getElementById('status').textContent='✅ значения загружены';
+    document.getElementById('status').textContent='OK';
   })
-  .catch(()=>{document.getElementById('status').textContent='⚠️ дефолтные значения';});
+  .catch(()=>{document.getElementById('status').textContent='defaults';});
 function cmd(params){
   fetch('http://'+location.hostname+':'+PORT+'/set?'+params)
-    .then(()=>{document.getElementById('status').textContent=new Date().toLocaleTimeString()+' OK';})
-    .catch(()=>{document.getElementById('status').textContent='❌ нет связи';});
+    .then(()=>{document.getElementById('status').textContent=new Date().toLocaleTimeString();})
+    .catch(()=>{document.getElementById('status').textContent='ERR';});
 }
 function send(){
   const p=ids.map(id=>id+'='+document.getElementById(id).value).join('&');
@@ -746,6 +758,10 @@ last_stream_time = 0
 gc_counter = 0
 steering_angle = 0.0
 STREAM_INTERVAL_MS = 100  # 10 кадров в секунду
+stream_fail_count = 0
+STREAM_FAIL_MAX = 30       # после 30 ошибок подряд — перезапуск стрима
+last_mem_log = 0
+last_state_update = 0
 
 # =========================
 # Main loop
@@ -773,19 +789,21 @@ while not app.need_exit():
         except Exception:
             pass
 
-    # обновляем кэш состояния для web-панели
-    _state_cache.update({
-        "z_yA": int(zone_config.yA_ratio        * 100),
-        "z_yB": int(zone_config.yB_ratio         * 100),
-        "z_na": int(zone_config.near_half_ratio  * 100),
-        "z_fa": int(zone_config.far_half_ratio   * 100),
-        "e_yB": int(exclusion_zone.yB_ratio      * 100),
-        "e_na": int(exclusion_zone.near_half_ratio * 100),
-        "e_fa": int(exclusion_zone.far_half_ratio  * 100),
-        "z_ly": int(zone_config.lmid_y_ratio    * 100),
-        "z_lh": int(zone_config.lmid_half_ratio * 100),
-        "det":  1 if zone_config.obstacle_detection_enabled else 0,
-    })
+    # обновляем кэш состояния для web-панели раз в секунду
+    if time.ticks_ms() - last_state_update > 1000:
+        last_state_update = time.ticks_ms()
+        _state_cache.update({
+            "z_yA": int(zone_config.yA_ratio        * 100),
+            "z_yB": int(zone_config.yB_ratio         * 100),
+            "z_na": int(zone_config.near_half_ratio  * 100),
+            "z_fa": int(zone_config.far_half_ratio   * 100),
+            "e_yB": int(exclusion_zone.yB_ratio      * 100),
+            "e_na": int(exclusion_zone.near_half_ratio * 100),
+            "e_fa": int(exclusion_zone.far_half_ratio  * 100),
+            "z_ly": int(zone_config.lmid_y_ratio    * 100),
+            "z_lh": int(zone_config.lmid_half_ratio * 100),
+            "det":  1 if zone_config.obstacle_detection_enabled else 0,
+        })
 
     # angle
     if angle_receiver.receive_angle():
@@ -985,12 +1003,45 @@ while not app.need_exit():
         if now_ms - last_stream_time >= STREAM_INTERVAL_MS:
             last_stream_time = now_ms
             try:
-                stream.write(img)  # JpegStreamer сам кодирует, без to_jpeg()
-            except Exception:
-                pass
+                ret = stream.write(img)
+                if ret == 0:  # err.ERR_NONE
+                    stream_fail_count = 0
+                else:
+                    raise Exception(f"write err={ret}")
+            except Exception as e:
+                stream_fail_count += 1
+                if stream_fail_count >= STREAM_FAIL_MAX:
+                    print(f"⚠️ Стрим упал {stream_fail_count} раз, перезапуск...")
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        gc.collect()
+                        stream = http.JpegStreamer()
+                        stream.set_html(html_page)
+                        ret = stream.start()
+                        if ret != 0:
+                            raise Exception(f"start err={ret}")
+                        stream_fail_count = 0
+                        print(f"✅ Стрим перезапущен: http://{stream.host()}:{stream.port()}")
+                    except Exception as e2:
+                        print(f"❌ Перезапуск не удался: {e2}")
+                        stream = None
 
-    # каждые 100 итераций принудительно чистим память
+    # каждые 50 итераций чистим память (чаще для долгой работы)
     gc_counter += 1
-    if gc_counter >= 100:
+    if gc_counter >= 50:
         gc_counter = 0
         gc.collect()
+
+    # лог памяти каждые 5 минут
+    now_ms = time.ticks_ms()
+    if now_ms - last_mem_log > 300000:
+        last_mem_log = now_ms
+        try:
+            import sys as _sys
+            free = _sys.memory_info().available if hasattr(_sys, 'memory_info') else -1
+            print(f"🧠 Память: {free} байт свободно")
+        except Exception:
+            pass
