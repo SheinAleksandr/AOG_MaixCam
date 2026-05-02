@@ -642,7 +642,11 @@ html_page = """<!DOCTYPE html>
   button{flex:1;padding:10px;font-size:14px;font-weight:bold;border:none;border-radius:6px}
   #bdet{background:#0a0;color:#fff}
   #bsave{background:#f90;color:#000}
+  #brec{background:#c00;color:#fff}
+  #brec.on{background:#f00;animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
   h3{margin:6px 0 2px;color:#aaa;font-size:12px;text-transform:uppercase}
+  #recinfo{font-size:12px;color:#f88;text-align:center;min-height:16px}
 </style>
 </head>
 <body>
@@ -664,6 +668,10 @@ html_page = """<!DOCTYPE html>
     <button id="bdet" onclick="toggleDet()">DETECT ON</button>
     <button id="bsave" onclick="saveCfg()">SAVE</button>
   </div>
+  <div class="btns">
+    <button id="brec" onclick="toggleRec()">REC</button>
+  </div>
+  <div id="recinfo"></div>
   <div id="status" style="font-size:11px;color:#888;text-align:center"></div>
 </div>
 <script>
@@ -691,6 +699,7 @@ fetch('http://'+location.hostname+':'+PORT+'/state')
       const b=document.getElementById('bdet');
       b.textContent=data.det?'DETECT ON':'DETECT OFF';
     }
+    updateRec(data);
     document.getElementById('status').textContent='OK';
   })
   .catch(()=>{document.getElementById('status').textContent='defaults';});
@@ -705,6 +714,26 @@ function send(){
 }
 function toggleDet(){cmd('toggle_det=1');}
 function saveCfg(){cmd('save=1');}
+function toggleRec(){cmd('toggle_rec=1');}
+function updateRec(data){
+  if(data.rec===undefined) return;
+  const b=document.getElementById('brec');
+  const info=document.getElementById('recinfo');
+  if(data.rec){
+    b.textContent='STOP REC';
+    b.classList.add('on');
+    info.textContent='REC: '+data.rec_count+' frames saved';
+  } else {
+    b.textContent='REC';
+    b.classList.remove('on');
+    info.textContent=data.rec_count>0?'Saved: '+data.rec_count+' frames':'';
+  }
+}
+// опрашиваем статус записи каждые 2 секунды
+setInterval(()=>{
+  fetch('http://'+location.hostname+':'+PORT+'/state')
+    .then(r=>r.json()).then(updateRec).catch(()=>{});
+}, 2000);
 </script>
 </body>
 </html>"""
@@ -763,11 +792,38 @@ STREAM_FAIL_MAX = 30       # после 30 ошибок подряд — пер�
 last_mem_log = 0
 last_state_update = 0
 
+# запись датасета
+recording = False
+rec_frame_count = 0
+rec_total = 0
+REC_EVERY = 5              # сохранять каждый 5-й кадр
+REC_DIR = "/root/dataset"
+try:
+    os.makedirs(REC_DIR)
+except Exception:
+    pass
+
 # =========================
 # Main loop
 # =========================
 while not app.need_exit():
     img = cam.read()
+
+    # сохранение чистого кадра для датасета — до любой отрисовки
+    if recording:
+        rec_frame_count += 1
+        if rec_frame_count >= REC_EVERY:
+            rec_frame_count = 0
+            try:
+                path = f"{REC_DIR}/{rec_total:06d}.jpg"
+                img.save(path)
+                # сохраняем угол руля рядом с кадром
+                with open(f"{REC_DIR}/{rec_total:06d}.txt", "w") as f:
+                    f.write(f"{steering_angle:.2f}")
+                rec_total += 1
+            except Exception as e:
+                print(f"❌ Ошибка сохранения кадра: {e}")
+
     objs = detector.detect(img, conf_th=0.5, iou_th=0.45)
     target_objects = [o for o in objs if o.class_id in class_names]
 
@@ -786,6 +842,13 @@ while not app.need_exit():
             if "e_fa" in p: exclusion_zone.far_half_ratio  = clamp(int(p["e_fa"]), 4, 44) / 100.0
             if p.get("toggle_det") == "1": zone_config.toggle_obstacle_detection()
             if p.get("save") == "1": save_config(zone_config, exclusion_zone)
+            if p.get("toggle_rec") == "1":
+                recording = not recording
+                if recording:
+                    rec_total = 0
+                    print(f"🔴 Запись начата → {REC_DIR}")
+                else:
+                    print(f"⏹ Запись остановлена, сохранено: {rec_total} кадров")
         except Exception:
             pass
 
@@ -802,7 +865,9 @@ while not app.need_exit():
             "e_fa": int(exclusion_zone.far_half_ratio  * 100),
             "z_ly": int(zone_config.lmid_y_ratio    * 100),
             "z_lh": int(zone_config.lmid_half_ratio * 100),
-            "det":  1 if zone_config.obstacle_detection_enabled else 0,
+            "det":       1 if zone_config.obstacle_detection_enabled else 0,
+            "rec":       1 if recording else 0,
+            "rec_count": rec_total,
         })
 
     # angle
