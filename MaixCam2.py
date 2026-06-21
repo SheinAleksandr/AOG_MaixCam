@@ -160,18 +160,31 @@ class AngleReceiver:
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.settimeout(0.02)
         self.udp_socket.bind(("0.0.0.0", listen_port))
-        self.current_angle = 0.0
+        self.current_angle  = 0.0  # актуальный угол — для динамики зоны
+        self.desired_angle  = 0.0  # желаемый угол  — для записи в датасет
 
     def receive_angle(self):
         try:
             data, _ = self.udp_socket.recvfrom(64)
             msg = data.decode("utf-8").strip()
-            if msg.startswith("ANGLE:"):
-                s = msg.replace("ANGLE:", "").strip()
+            # Новый формат: ANGLE_ACT:12.5:DES:-3.2
+            if msg.startswith("ANGLE_ACT:"):
                 try:
-                    self.current_angle = float(s)
+                    # парсим оба значения
+                    parts = msg.split(":")
+                    # parts = ['ANGLE_ACT', '12.5', 'DES', '-3.2']
+                    self.current_angle = float(parts[1])
+                    self.desired_angle = float(parts[3])
                     return True
-                except ValueError:
+                except (ValueError, IndexError):
+                    return False
+            # Обратная совместимость со старым форматом: ANGLE:12.5
+            if msg.startswith("ANGLE:"):
+                try:
+                    self.current_angle = float(msg.split(":")[1])
+                    self.desired_angle = self.current_angle
+                    return True
+                except (ValueError, IndexError):
                     return False
         except socket.timeout:
             return False
@@ -851,7 +864,8 @@ last_obstacle_print = 0
 last_angle_print = 0
 last_stream_time = 0
 gc_counter = 0
-steering_angle = 0.0
+steering_angle = 0.0   # актуальный угол — для динамики зоны
+desired_angle  = 0.0   # желаемый угол  — для записи в датасет
 STREAM_INTERVAL_MS = 100  # 10 кадров в секунду
 stream_fail_count = 0
 STREAM_FAIL_MAX = 30       # после 30 ошибок подряд — перезапуск стрима
@@ -864,6 +878,8 @@ rec_frame_count = 0
 rec_total = 0
 REC_EVERY = 5              # сохранять каждый 5-й кадр
 REC_DIR = "/root/dataset"
+CSV_PATH = "/root/dataset/manifest.csv"
+rec_csv_file = None
 try:
     os.makedirs(REC_DIR)
 except Exception:
@@ -884,11 +900,11 @@ while not app.need_exit():
         if rec_frame_count >= REC_EVERY:
             rec_frame_count = 0
             try:
-                path = f"{REC_DIR}/{rec_total:06d}.jpg"
-                img.save(path)
-                # сохраняем угол руля рядом с кадром
-                with open(f"{REC_DIR}/{rec_total:06d}.txt", "w") as f:
-                    f.write(f"{steering_angle:.2f}")
+                fname = f"{rec_total:06d}.jpg"
+                img.save(f"{REC_DIR}/{fname}")
+                if rec_csv_file is not None:
+                    rec_csv_file.write(f"{fname},{desired_angle:.2f}\n")
+                    rec_csv_file.flush()
                 rec_total += 1
             except Exception as e:
                 print(f"❌ Ошибка сохранения кадра: {e}")
@@ -920,9 +936,25 @@ while not app.need_exit():
                         rec_total = len(existing)
                     except Exception:
                         rec_total = 0
+                    # открываем CSV: заголовок только если файл новый
+                    try:
+                        write_header = not os.path.exists(CSV_PATH)
+                        rec_csv_file = open(CSV_PATH, "a")
+                        if write_header:
+                            rec_csv_file.write("filename,angle\n")
+                            rec_csv_file.flush()
+                    except Exception as e:
+                        print(f"❌ Ошибка открытия CSV: {e}")
+                        rec_csv_file = None
                     print(f"🔴 Запись начата → {REC_DIR} (старт с {rec_total})")
                 else:
-                    print(f"⏹ Запись остановлена, сохранено: {rec_total} кадров")
+                    if rec_csv_file is not None:
+                        try:
+                            rec_csv_file.close()
+                        except Exception:
+                            pass
+                        rec_csv_file = None
+                    print(f"⏹ Запись остановлена, сохранено: {rec_total} кадров → {CSV_PATH}")
         except Exception:
             pass
 
@@ -946,10 +978,11 @@ while not app.need_exit():
 
     # angle
     if angle_receiver.receive_angle():
-        steering_angle = angle_receiver.current_angle
+        steering_angle = angle_receiver.current_angle  # актуальный → зона
+        desired_angle  = angle_receiver.desired_angle  # желаемый  → датасет
         now = time.ticks_ms()
         if now - last_angle_print > 1000:
-            print(f"📥 Угол от ESP32: {steering_angle:.1f}°")
+            print(f"📥 Угол от ESP32: акт={steering_angle:.1f}° жел={desired_angle:.1f}°")
             last_angle_print = now
 
     # touch
