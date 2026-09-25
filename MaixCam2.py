@@ -81,31 +81,34 @@ except Exception as e:
 # Wi-Fi manager
 # =========================
 class WiFiManager:
-    """MaixCam2 работает как точка доступа (AP).
-    ESP32 подключается к этой сети. Стрим и UDP идут напрямую через радио камеры."""
+    """MaixCam2 подключается к AP ESP32 (STA режим).
+    AP режим на MaixCAM2 не поддерживается (Err.ERR_NOT_IMPL в текущей прошивке)."""
     def __init__(self):
         self.wifi = network.wifi.Wifi()
         self.udp_socket = None
-        self.esp32_broadcast = "192.168.66.255"  # broadcast в сети MaixCam AP
+        self.esp32_ip = "192.168.4.1"
         self.esp32_port = 8888
         self.connected = False
         self.ssid = None
         self.password = None
+        self._reconnecting = False
 
-    def start_ap(self, ssid, password):
-        """AP уже поднята в начале скрипта — только создаём UDP-сокет."""
+    def connect(self, ssid, password, timeout=30):
         self.ssid = ssid
         self.password = password
+        print(f"📡 Подключение к Wi-Fi: {ssid}")
         try:
-            my_ip = self.wifi.get_ip()
-            is_ap = self.wifi.is_ap_mode()
-            print(f"✅ AP активна! IP: {my_ip}, AP mode: {is_ap}")
-            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            self.connected = is_ap
-            return is_ap
+            e = self.wifi.connect(ssid, password, wait=True, timeout=timeout)
+            if e == 0:
+                self.connected = True
+                new_ip = self.wifi.get_ip()
+                print(f"✅ Wi-Fi подключен! IP: {new_ip}")
+                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                return True
+            print(f"❌ Ошибка подключения Wi-Fi: {e}")
+            return False
         except Exception as e:
-            print(f"❌ Ошибка инициализации UDP: {e}")
+            print(f"❌ Ошибка настройки Wi-Fi: {e}")
             return False
 
     def send_obstacle_data(self, has_obstacle, obstacle_count, steering_angle):
@@ -113,15 +116,38 @@ class WiFiManager:
             return False
         try:
             msg = f"OBSTACLE:{1 if has_obstacle else 0}:COUNT:{obstacle_count}:ANGLE:{steering_angle:.1f}"
-            self.udp_socket.sendto(msg.encode("utf-8"), (self.esp32_broadcast, self.esp32_port))
+            self.udp_socket.sendto(msg.encode("utf-8"), (self.esp32_ip, self.esp32_port))
             return True
         except Exception as e:
             print(f"❌ Ошибка отправки UDP: {e}")
             return False
 
+    def _is_alive(self):
+        try:
+            ip = self.wifi.get_ip()
+            return bool(ip) and ip not in ("0.0.0.0", "")
+        except Exception:
+            return False
+
     def start_auto_reconnect(self, check_interval_ms=8000):
-        """AP не отключается сама — ничего дополнительно делать не нужно."""
-        pass
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        def _loop():
+            while True:
+                try:
+                    if not self._is_alive():
+                        self.connected = False
+                        if self.ssid:
+                            print("📡 Wi-Fi не подключён, переподключаюсь...")
+                            self.connect(self.ssid, self.password, timeout=15)
+                    else:
+                        self.connected = True
+                except Exception as e:
+                    print(f"⚠️ Wi-Fi reconnect: {e}")
+                time.sleep_ms(check_interval_ms)
+        threading.Thread(target=_loop, daemon=True).start()
+        print("🔁 Авто-переподключение Wi-Fi включено")
 
 # =========================
 # Angle receiver
@@ -578,26 +604,6 @@ class ObstacleStabilizer:
 # =========================
 # Wi-Fi AP — запускаем ДО модели/камеры/дисплея
 # =========================
-_early_wifi = network.wifi.Wifi()
-# Сначала отключаем любой текущий режим
-if _early_wifi.is_ap_mode():
-    _early_wifi.stop_ap()
-    time.sleep_ms(1000)
-if _early_wifi.is_connected():
-    _early_wifi.disconnect()
-    time.sleep_ms(1000)
-# Поднимаем AP
-_ap_err = _early_wifi.start_ap("AOG4", "12345678")
-print(f"📡 start_ap() вернул: {_ap_err}")
-# MaixCAM2: ждём пока AP поднимется (макс 15с)
-for _i in range(30):
-    _ip = _early_wifi.get_ip()
-    _ap = _early_wifi.is_ap_mode()
-    if _ap and _ip:
-        break
-    time.sleep_ms(500)
-print(f"📡 AP ранний старт: IP={_early_wifi.get_ip()}, AP={_early_wifi.is_ap_mode()}")
-
 # =========================
 # Model / Camera / Display
 # =========================
@@ -840,8 +846,8 @@ class_names = {
 wifi_manager = WiFiManager()
 SSID = "AOG4"
 PASSWORD = "12345678"
-wifi_connected = wifi_manager.start_ap(SSID, PASSWORD)  # камера — точка доступа
-wifi_manager.start_auto_reconnect()   # no-op для AP
+wifi_connected = wifi_manager.connect(SSID, PASSWORD)  # STA: подключаемся к AP ESP32
+wifi_manager.start_auto_reconnect()
 web_server = WebControlServer(port=8765)
 web_server.start()
 
