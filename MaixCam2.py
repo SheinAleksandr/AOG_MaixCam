@@ -582,7 +582,12 @@ _early_wifi = network.wifi.Wifi()
 if _early_wifi.is_ap_mode():
     _early_wifi.stop_ap()
 _early_wifi.start_ap("AOG4", "12345678")
-print(f"📡 AP поднята (ранний старт), IP: {_early_wifi.get_ip()}")
+# MaixCAM2: start_ap асинхронный — ждём пока AP поднимется (макс 10с)
+for _i in range(20):
+    if _early_wifi.is_ap_mode() and _early_wifi.get_ip():
+        break
+    time.sleep_ms(500)
+print(f"📡 AP поднята (ранний старт), IP: {_early_wifi.get_ip()}, AP: {_early_wifi.is_ap_mode()}")
 
 # =========================
 # Model / Camera / Display
