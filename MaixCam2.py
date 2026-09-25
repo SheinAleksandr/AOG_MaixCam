@@ -579,15 +579,24 @@ class ObstacleStabilizer:
 # Wi-Fi AP — запускаем ДО модели/камеры/дисплея
 # =========================
 _early_wifi = network.wifi.Wifi()
+# Сначала отключаем любой текущий режим
 if _early_wifi.is_ap_mode():
     _early_wifi.stop_ap()
-_early_wifi.start_ap("AOG4", "12345678")
-# MaixCAM2: start_ap асинхронный — ждём пока AP поднимется (макс 10с)
-for _i in range(20):
-    if _early_wifi.is_ap_mode() and _early_wifi.get_ip():
+    time.sleep_ms(1000)
+if _early_wifi.is_connected():
+    _early_wifi.disconnect()
+    time.sleep_ms(1000)
+# Поднимаем AP
+_ap_err = _early_wifi.start_ap("AOG4", "12345678")
+print(f"📡 start_ap() вернул: {_ap_err}")
+# MaixCAM2: ждём пока AP поднимется (макс 15с)
+for _i in range(30):
+    _ip = _early_wifi.get_ip()
+    _ap = _early_wifi.is_ap_mode()
+    if _ap and _ip:
         break
     time.sleep_ms(500)
-print(f"📡 AP поднята (ранний старт), IP: {_early_wifi.get_ip()}, AP: {_early_wifi.is_ap_mode()}")
+print(f"📡 AP ранний старт: IP={_early_wifi.get_ip()}, AP={_early_wifi.is_ap_mode()}")
 
 # =========================
 # Model / Camera / Display
