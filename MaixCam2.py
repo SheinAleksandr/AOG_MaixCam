@@ -81,33 +81,31 @@ except Exception as e:
 # Wi-Fi manager
 # =========================
 class WiFiManager:
+    """MaixCam2 работает как точка доступа (AP).
+    ESP32 подключается к этой сети. Стрим и UDP идут напрямую через радио камеры."""
     def __init__(self):
         self.wifi = network.wifi.Wifi()
         self.udp_socket = None
-        self.esp32_ip = "192.168.4.1"
+        self.esp32_broadcast = "192.168.66.255"  # broadcast в сети MaixCam AP
         self.esp32_port = 8888
         self.connected = False
         self.ssid = None
         self.password = None
-        self._reconnecting = False
 
-    def connect(self, ssid, password, timeout=30):
+    def start_ap(self, ssid, password):
+        """AP уже поднята в начале скрипта — только создаём UDP-сокет."""
         self.ssid = ssid
         self.password = password
-        print(f"📡 Подключение к Wi-Fi: {ssid}")
         try:
-            e = self.wifi.connect(ssid, password, wait=True, timeout=timeout)
-            if e == 0:
-                self.connected = True
-                new_ip = self.wifi.get_ip()
-                print(f"✅ Wi-Fi подключен! IP: {new_ip}")
-                self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                print(f"✅ UDP сокет создан для отправки на {self.esp32_ip}:{self.esp32_port}")
-                return True
-            print(f"❌ Ошибка подключения Wi-Fi: {e}")
-            return False
+            my_ip = self.wifi.get_ip()
+            is_ap = self.wifi.is_ap_mode()
+            print(f"✅ AP активна! IP: {my_ip}, AP mode: {is_ap}")
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.connected = is_ap
+            return is_ap
         except Exception as e:
-            print(f"❌ Ошибка настройки Wi-Fi: {e}")
+            print(f"❌ Ошибка инициализации UDP: {e}")
             return False
 
     def send_obstacle_data(self, has_obstacle, obstacle_count, steering_angle):
@@ -115,82 +113,67 @@ class WiFiManager:
             return False
         try:
             msg = f"OBSTACLE:{1 if has_obstacle else 0}:COUNT:{obstacle_count}:ANGLE:{steering_angle:.1f}"
-            self.udp_socket.sendto(msg.encode("utf-8"), (self.esp32_ip, self.esp32_port))
+            self.udp_socket.sendto(msg.encode("utf-8"), (self.esp32_broadcast, self.esp32_port))
             return True
         except Exception as e:
             print(f"❌ Ошибка отправки UDP: {e}")
             return False
 
-    def _is_alive(self):
-        try:
-            ip = self.wifi.get_ip()
-            return bool(ip) and ip not in ("0.0.0.0", "")
-        except Exception:
-            return False
-
     def start_auto_reconnect(self, check_interval_ms=8000):
-        """Фоновый поток: если Wi-Fi отвалился (или не поднялся при старте),
-        периодически пытается переподключиться, не требуя перезапуска скрипта."""
-        if self._reconnecting:
-            return
-        self._reconnecting = True
-
-        def _loop():
-            while True:
-                try:
-                    if not self._is_alive():
-                        self.connected = False
-                        if self.ssid:
-                            print("📡 Wi-Fi не подключён, пробую переподключиться...")
-                            self.connect(self.ssid, self.password, timeout=15)
-                    else:
-                        self.connected = True
-                except Exception as e:
-                    print(f"⚠️ Wi-Fi reconnect: {e}")
-                time.sleep_ms(check_interval_ms)
-
-        threading.Thread(target=_loop, daemon=True).start()
-        print("🔁 Авто-переподключение Wi-Fi включено")
+        """AP не отключается сама — ничего дополнительно делать не нужно."""
+        pass
 
 # =========================
 # Angle receiver
 # =========================
 class AngleReceiver:
+    """Приём угла от ESP32 в фоновом потоке — главный цикл не блокируется."""
     def __init__(self, listen_port=8889):
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_socket.settimeout(0.02)
+        self.udp_socket.settimeout(1.0)
         self.udp_socket.bind(("0.0.0.0", listen_port))
         self.current_angle  = 0.0  # актуальный угол — для динамики зоны
         self.desired_angle  = 0.0  # желаемый угол  — для записи в датасет
+        self.updated        = False
+        self._running       = False
 
-    def receive_angle(self):
-        try:
-            data, _ = self.udp_socket.recvfrom(64)
-            msg = data.decode("utf-8").strip()
-            # Новый формат: ANGLE_ACT:12.5:DES:-3.2
-            if msg.startswith("ANGLE_ACT:"):
+    def _parse(self, msg):
+        msg = msg.strip()
+        if msg.startswith("ANGLE_ACT:"):
+            try:
+                parts = msg.split(":")
+                self.current_angle = float(parts[1])
+                self.desired_angle = float(parts[3])
+                self.updated = True
+                return True
+            except (ValueError, IndexError):
+                return False
+        if msg.startswith("ANGLE:"):
+            try:
+                self.current_angle = float(msg.split(":")[1])
+                self.desired_angle = self.current_angle
+                self.updated = True
+                return True
+            except (ValueError, IndexError):
+                return False
+        return False
+
+    def start_background(self):
+        """Запускает фоновый поток приёма угла — вызвать один раз при старте."""
+        if self._running:
+            return
+        self._running = True
+        def _loop():
+            while self._running:
                 try:
-                    # парсим оба значения
-                    parts = msg.split(":")
-                    # parts = ['ANGLE_ACT', '12.5', 'DES', '-3.2']
-                    self.current_angle = float(parts[1])
-                    self.desired_angle = float(parts[3])
-                    return True
-                except (ValueError, IndexError):
-                    return False
-            # Обратная совместимость со старым форматом: ANGLE:12.5
-            if msg.startswith("ANGLE:"):
-                try:
-                    self.current_angle = float(msg.split(":")[1])
-                    self.desired_angle = self.current_angle
-                    return True
-                except (ValueError, IndexError):
-                    return False
-        except socket.timeout:
-            return False
-        except Exception as e:
-            print(f"❌ Ошибка приема угла: {e}")
-            return False
+                    data, _ = self.udp_socket.recvfrom(64)
+                    self._parse(data.decode("utf-8"))
+                except socket.timeout:
+                    pass
+                except Exception as e:
+                    print(f"❌ AngleReceiver: {e}")
+        threading.Thread(target=_loop, daemon=True).start()
+        print("🔁 AngleReceiver: фоновый приём угла запущен")
 
 # =========================
 # Touch calibration (simple scaling)
@@ -593,10 +576,17 @@ class ObstacleStabilizer:
         return self.stable
 
 # =========================
+# Wi-Fi AP — запускаем ДО модели/камеры/дисплея
+# =========================
+_early_wifi = network.wifi.Wifi()
+if _early_wifi.is_ap_mode():
+    _early_wifi.stop_ap()
+_early_wifi.start_ap("AOG4", "12345678")
+print(f"📡 AP поднята (ранний старт), IP: {_early_wifi.get_ip()}")
+
+# =========================
 # Model / Camera / Display
 # =========================
-# YOLO26 поддерживается нативно (MaixPy >= 4.12.5).
-# Модель .mud должна быть собрана под MaixCAM2 (axmodel), иначе загрузка упадёт.
 MODEL_PATH = "/root/models/yolo26n.mud"
 try:
     detector = nn.YOLO26(model=MODEL_PATH, dual_buff=True)
@@ -836,8 +826,8 @@ class_names = {
 wifi_manager = WiFiManager()
 SSID = "AOG4"
 PASSWORD = "12345678"
-wifi_connected = wifi_manager.connect(SSID, PASSWORD)
-wifi_manager.start_auto_reconnect()   # если сеть не поднялась — подключится в фоне без перезапуска
+wifi_connected = wifi_manager.start_ap(SSID, PASSWORD)  # камера — точка доступа
+wifi_manager.start_auto_reconnect()   # no-op для AP
 web_server = WebControlServer(port=8765)
 web_server.start()
 
@@ -845,6 +835,7 @@ web_server.start()
 # Angle receiver
 # =========================
 angle_receiver = AngleReceiver()
+angle_receiver.start_background()  # угол приходит в фоне, главный цикл не блокируется
 
 # =========================
 # Zone + touch calibrator
@@ -976,8 +967,9 @@ while not app.need_exit():
             "rec_count": rec_total,
         })
 
-    # angle
-    if angle_receiver.receive_angle():
+    # angle — читаем кэш фонового потока, без блокировки
+    if angle_receiver.updated:
+        angle_receiver.updated = False
         steering_angle = angle_receiver.current_angle  # актуальный → зона
         desired_angle  = angle_receiver.desired_angle  # желаемый  → датасет
         now = time.ticks_ms()
