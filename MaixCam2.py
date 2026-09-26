@@ -38,8 +38,14 @@ def save_config(zone, excl):
     }
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        with open(CONFIG_PATH, "w") as f:
+        # атомарно: пишем во временный файл и подменяем — при обрыве питания
+        # остаётся либо старый, либо новый файл целиком, но не обрезанный
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
         print(f"💾 Настройки сохранены: {CONFIG_PATH}")
     except Exception as e:
         print(f"❌ Ошибка сохранения: {e}")
@@ -111,8 +117,12 @@ def _write_if_changed(path, text):
     d = os.path.dirname(path)
     if d:
         os.makedirs(d, exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path + ".tmp"   # атомарно (защита от обрыва питания, особенно на FAT /boot)
+    with open(tmp, "w") as f:
         f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
     return True
 
 def ap_runtime_fix():
@@ -750,7 +760,17 @@ except Exception as e:
 # MaixCAM2 / SC850SL: 1280x720, RGB888.
 # detect() сам отресайзит кадр под вход модели (FIT_CONTAIN) и пересчитает координаты рамок.
 cam = camera.Camera(1280, 720, detector.input_format())
+# Экран не нужен: камера в корпусе на крыше, настройка — через веб-интерфейс.
+# Гасим подсветку и не выводим кадры (экономия CPU на resize 1280x720 + меньше тепла).
+# Для отладки на столе поставить DISPLAY_ENABLED = True.
+DISPLAY_ENABLED = False
 disp = display.Display()
+if not DISPLAY_ENABLED:
+    try:
+        disp.set_backlight(0)
+        print("🖥️ Экран выключен (DISPLAY_ENABLED = False)")
+    except Exception as e:
+        print(f"⚠️ Не удалось погасить подсветку: {e}")
 
 # =========================
 # Web control server (порт 8765) — приём команд от браузера
@@ -1129,7 +1149,9 @@ while not app.need_exit():
             last_angle_print = now
 
     # touch
-    if touchscreen and touchscreen.available():
+    # без экрана касания не обрабатываем: ложные срабатывания (конденсат, вибрация)
+    # могли бы переключить DET/EDIT
+    if DISPLAY_ENABLED and touchscreen and touchscreen.available():
         try:
             td = touchscreen.read()
             if td and len(td) >= 3:
@@ -1310,7 +1332,8 @@ while not app.need_exit():
         img.draw_rect(cam.width() // 2 - 150, 45, 300, 28, color=image.COLOR_GRAY, thickness=-1)
         img.draw_string(cam.width() // 2 - 140, 52, "DETECTION DISABLED", color=image.COLOR_WHITE, scale=0.8)
 
-    disp.show(img.resize(disp.width(), disp.height(), image.Fit.FIT_FILL))
+    if DISPLAY_ENABLED:
+        disp.show(img.resize(disp.width(), disp.height(), image.Fit.FIT_FILL))
 
     # трансляция кадра на телефон через HTTP
     if stream is not None:
