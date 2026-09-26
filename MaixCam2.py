@@ -11,6 +11,7 @@ import gc
 import json
 import os
 import threading
+import subprocess
 import queue as _queue
 
 device_id = sys.device_id()
@@ -78,31 +79,135 @@ except Exception as e:
     touchscreen = None
 
 # =========================
+# Wi-Fi AP для MaixCAM2
+# =========================
+# maix.network.wifi.Wifi.start_ap() на MaixCAM2 = ERR_NOT_IMPL, но прошивка умеет AP
+# через /opt/scripts/wifi.sh (флаг /boot/wifi.ap). В прошивке 3 бага, обходим их:
+#  1) wifi.service: Type=simple + Restart=always, а в AP wifi.sh сразу выходит (hostapd -B)
+#     -> systemd убивает hostapd и перезапускает службу по кругу. Лечим drop-in RemainAfterExit.
+#  2) gen_udhcpd_conf не определена -> /etc/udhcpd.wlan0.conf пустой, DHCP не работает.
+#  3) IP 192.168.66.1 на wlan0 теряется после старта hostapd -> ставим сами.
+AP_SSID = "AOG4"
+AP_PASS = "12345678"        # WPA2: минимум 8 символов
+AP_PREFIX = "192.168.66"    # камера = .1, клиенты (ESP32 и т.д.) = .2-.254 по DHCP
+AP_CHANNEL = 6
+_WIFI_DROPIN = "/etc/systemd/system/wifi.service.d/ap-mode.conf"
+_UDHCPD_CONF = "/etc/udhcpd.wlan0.conf"
+
+def _sh(cmd):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        return (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return f"ERR {e}"
+
+def _write_if_changed(path, text):
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return False
+    except Exception:
+        pass
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    return True
+
+def ap_runtime_fix():
+    """Дешёвая проверка/починка: IP на wlan0 и DHCP. Можно звать часто."""
+    if "hostapd" not in _sh("pgrep -a hostapd"):
+        return False
+    if f"{AP_PREFIX}.1/" not in _sh("ip -4 addr show wlan0"):
+        _sh(f"ip addr add {AP_PREFIX}.1/24 dev wlan0")
+    if "udhcpd.wlan0" not in _sh("pgrep -a udhcpd"):
+        os.makedirs("/var/lib/misc", exist_ok=True)
+        _sh("touch /var/lib/misc/udhcpd.wlan0.leases")
+        _sh(f"udhcpd -S {_UDHCPD_CONF}")
+    return f"{AP_PREFIX}.1/" in _sh("ip -4 addr show wlan0")
+
+def ensure_ap(timeout_s=25):
+    """Настроить и поднять AP. Службу wifi перезапускает только если конфиг поменялся
+    или hostapd не запущен (чтобы не терять ~5с при каждом старте)."""
+    changed = False
+    if os.path.exists("/boot/wifi.sta"):
+        os.remove("/boot/wifi.sta"); changed = True
+    if not os.path.exists("/boot/wifi.ap"):
+        _write_if_changed("/boot/wifi.ap", ""); changed = True
+    changed |= _write_if_changed("/boot/wifi.ssid", AP_SSID)
+    changed |= _write_if_changed("/boot/wifi.pass", AP_PASS)
+    changed |= _write_if_changed("/boot/wifi.ipv4_prefix", AP_PREFIX)
+    changed |= _write_if_changed("/boot/hostapd.conf", "\n".join([
+        "ctrl_interface=/var/run/hostapd", "ctrl_interface_group=0",
+        f"ssid={AP_SSID}", "hw_mode=g", f"channel={AP_CHANNEL}",
+        "beacon_int=100", "dtim_period=2", "max_num_sta=255",
+        "rts_threshold=-1", "fragm_threshold=-1", "macaddr_acl=0",
+        "auth_algs=3", "wpa=2", f"wpa_passphrase={AP_PASS}",
+        "wpa_key_mgmt=WPA-PSK", "rsn_pairwise=CCMP", "ieee80211n=1", ""]))
+    changed |= _write_if_changed(_UDHCPD_CONF,
+        f"start {AP_PREFIX}.2\nend {AP_PREFIX}.254\ninterface wlan0\n"
+        f"pidfile /run/udhcpd.wlan0.pid\nlease_file /var/lib/misc/udhcpd.wlan0.leases\n"
+        f"opt subnet 255.255.255.0\nopt router {AP_PREFIX}.1\nopt lease 86400\n")
+    dropin_changed = _write_if_changed(_WIFI_DROPIN, "[Service]\nRemainAfterExit=yes\nRestart=on-failure\n")
+    os.sync()
+    if dropin_changed:
+        _sh("systemctl daemon-reload")
+    if changed or dropin_changed or "hostapd" not in _sh("pgrep -a hostapd"):
+        print("📡 AP: перезапуск службы wifi...")
+        # наш udhcpd живёт вне службы wifi и не умирает при её рестарте: после пересоздания
+        # wlan0 он висит на мёртвом интерфейсе, а pgrep считает его живым -> убиваем заранее
+        _sh("pkill -f '[u]dhcpd -S /etc/udhcpd.wlan0'")  # [u] - чтобы не убить свой sh
+        _sh("systemctl restart wifi")
+    t0 = time.ticks_s()
+    while time.ticks_s() - t0 < timeout_s:
+        if ap_runtime_fix():
+            print(f"✅ AP '{AP_SSID}' поднята, IP={AP_PREFIX}.1")
+            return True
+        time.sleep_ms(500)
+    print("❌ AP не поднялась:", _sh("systemctl is-active wifi"), _sh("pgrep -a hostapd"))
+    return False
+
+# =========================
 # Wi-Fi manager
 # =========================
 class WiFiManager:
-    """MaixCam2 подключается к AP ESP32 (STA режим).
-    AP режим на MaixCAM2 не поддерживается (Err.ERR_NOT_IMPL в текущей прошивке)."""
+    """AP-режим: камера — точка доступа AP_SSID, ESP32 подключается к ней клиентом.
+    Данные шлются UDP broadcast'ом в сеть AP_PREFIX.255."""
     def __init__(self):
         self.wifi = network.wifi.Wifi()
         self.udp_socket = None
-        self.esp32_ip = "192.168.4.1"
+        self.esp32_ip = "192.168.4.1"        # STA: IP точки доступа ESP32
+        self.esp32_broadcast = AP_PREFIX + ".255"  # AP: broadcast в сети камеры
         self.esp32_port = 8888
         self.connected = False
+        self.is_ap = False                    # True если работаем в AP режиме
         self.ssid = None
         self.password = None
         self._reconnecting = False
 
+    def start_ap(self, ssid, password):
+        """AP уже поднята в начале скрипта (ensure_ap) — создаём UDP-сокет.
+        UDP-сокет создаём в любом случае: сторож (start_auto_reconnect) поднимет AP позже.
+        В STA НЕ откатываемся: connect() пишет /boot/wifi.sta и ломает настройку AP."""
+        self.ssid = ssid
+        self.password = password
+        self.is_ap = True
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.connected = ap_runtime_fix()
+        print(f"{'✅' if self.connected else '⚠️'} WiFiManager: AP режим, IP={AP_PREFIX}.1, up={self.connected}")
+        return self.connected
+
     def connect(self, ssid, password, timeout=30):
         self.ssid = ssid
         self.password = password
-        print(f"📡 Подключение к Wi-Fi: {ssid}")
+        print(f"📡 STA: подключение к {ssid}")
         try:
             e = self.wifi.connect(ssid, password, wait=True, timeout=timeout)
             if e == 0:
                 self.connected = True
-                new_ip = self.wifi.get_ip()
-                print(f"✅ Wi-Fi подключен! IP: {new_ip}")
+                print(f"✅ Wi-Fi подключен! IP: {self.wifi.get_ip()}")
                 self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 return True
             print(f"❌ Ошибка подключения Wi-Fi: {e}")
@@ -116,7 +221,8 @@ class WiFiManager:
             return False
         try:
             msg = f"OBSTACLE:{1 if has_obstacle else 0}:COUNT:{obstacle_count}:ANGLE:{steering_angle:.1f}"
-            self.udp_socket.sendto(msg.encode("utf-8"), (self.esp32_ip, self.esp32_port))
+            dest = self.esp32_broadcast if self.is_ap else self.esp32_ip
+            self.udp_socket.sendto(msg.encode("utf-8"), (dest, self.esp32_port))
             return True
         except Exception as e:
             print(f"❌ Ошибка отправки UDP: {e}")
@@ -133,6 +239,24 @@ class WiFiManager:
         if self._reconnecting:
             return
         self._reconnecting = True
+        if self.is_ap:
+            def _ap_loop():
+                fails = 0
+                while True:
+                    try:
+                        ok = ap_runtime_fix()
+                        self.connected = ok
+                        fails = 0 if ok else fails + 1
+                        if fails >= 3:   # ~24с без hostapd — поднимаем заново
+                            print("📡 AP пропала, поднимаю заново...")
+                            self.connected = ensure_ap()
+                            fails = 0
+                    except Exception as e:
+                        print(f"⚠️ AP watchdog: {e}")
+                    time.sleep_ms(check_interval_ms)
+            threading.Thread(target=_ap_loop, daemon=True).start()
+            print("🔁 Сторож AP включён")
+            return
         def _loop():
             while True:
                 try:
@@ -602,8 +726,15 @@ class ObstacleStabilizer:
         return self.stable
 
 # =========================
-# Wi-Fi AP — запускаем ДО модели/камеры/дисплея
+# Wi-Fi AP — поднимаем ДО модели/камеры/дисплея.
+# Не через network.wifi.start_ap() (ERR_NOT_IMPL на MaixCAM2), а через системный wifi.sh.
+# stop_ap()/disconnect() на MaixCAM2 бросают исключение — не вызываем.
 # =========================
+try:
+    ensure_ap()
+except Exception as e:
+    print(f"❌ ensure_ap: {e}")
+
 # =========================
 # Model / Camera / Display
 # =========================
@@ -844,9 +975,9 @@ class_names = {
 # Wi-Fi
 # =========================
 wifi_manager = WiFiManager()
-SSID = "AOG4"
-PASSWORD = "12345678"
-wifi_connected = wifi_manager.connect(SSID, PASSWORD)  # STA: подключаемся к AP ESP32
+SSID = AP_SSID
+PASSWORD = AP_PASS
+wifi_connected = wifi_manager.start_ap(SSID, PASSWORD)  # камера = точка доступа
 wifi_manager.start_auto_reconnect()
 web_server = WebControlServer(port=8765)
 web_server.start()
